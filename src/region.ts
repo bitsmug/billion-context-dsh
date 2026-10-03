@@ -65,7 +65,11 @@ export interface AcpBlockLedgerEntry {
   readonly parentBlockIds: readonly string[]
   /** The acp-kernel block id (`bN`) created for this transaction — absent for legacy blocks (synthesised by order). */
   readonly kernelBlockId?: string
-  /** The surface seq of this block's checkpoint summary node (derived from the log; null when the node is gone). */
+  /**
+   * The seq of this block's checkpoint summary node (first one wins), derived
+   * from the LOG — so it can name a node a later compression already folded off
+   * the surface. Read `blockRegistry` when the answer must be a SURFACE seq.
+   */
   readonly summarySeq?: number
   /** The kernel block's raw direct/effective message ids at creation (recorded since the tier feature; absent for legacy). */
   readonly directMessageIds?: readonly string[]
@@ -1298,7 +1302,14 @@ export interface AcpBlockRegistryEntry {
   /** The acp-kernel block ref (`bN`); synthesised by log order for legacy blocks. */
   readonly kernelBlockId: string
   readonly tier: 1 | 2 | 3
-  /** The surface seq of this block's checkpoint summary node (null when gone). */
+  /**
+   * The SURFACE seq of this block's checkpoint summary node — null when the
+   * node is gone (a later compression folded it off the surface, or the block
+   * never had one). Never a log-only seq: both readers of this field ship it to
+   * the model as a compress/distill target (acp_status's `Checkpoint seqs` row,
+   * the nudge tier line), and a dead seq there reads as a live distillation
+   * edge while every compress on it can only answer "already compressed".
+   */
   readonly summarySeq: number | null
   /** True until a LATER block distills this one. Only active blocks are distillable. */
   readonly active: boolean
@@ -1313,6 +1324,15 @@ export interface AcpBlockRegistryEntry {
  */
 export function blockRegistry(session: Session): AcpBlockRegistryEntry[] {
   const ledger = rebuildBlockLedger(sessionEventsOf(session))
+  // The ledger derives `summarySeq` from the LOG, where a checkpoint event never
+  // disappears — but this field's contract is a SURFACE seq ("null when gone").
+  // A later compression that folds the checkpoint node leaves the event in the
+  // log and removes the node from the surface, so the log-derived seq alone
+  // advertises a dead distill target: acp_status's `Checkpoint seqs` row and the
+  // nudge tier line both hand it to the model, and compressing it can only end
+  // in "already compressed". Filter against the live surface here — the one
+  // place both readers go through — rather than at each reader.
+  const liveSurface = new Set<number>(session.surface.nodes)
   const kernelIdOf = new Map<string, string>()
   const raw: AcpBlockRegistryEntry[] = []
   let next = 1
@@ -1331,7 +1351,8 @@ export function blockRegistry(session: Session): AcpBlockRegistryEntry[] {
       blockId: entry.blockId,
       kernelBlockId,
       tier: entry.tier,
-      summarySeq: entry.summarySeq ?? null,
+      summarySeq:
+        entry.summarySeq !== undefined && liveSurface.has(entry.summarySeq) ? entry.summarySeq : null,
       active: true,
       parentBlockIds: [...entry.parentBlockIds],
     })

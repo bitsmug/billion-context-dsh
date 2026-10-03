@@ -444,6 +444,37 @@ function anchorRefForNode(
   return undefined
 }
 
+/**
+ * The dedicated "already compressed" copy for a range whose EDGE is a block
+ * checkpoint node a LATER block has already folded. The generic line ("nothing
+ * to reclaim; decompress to recover the originals") is true but useless here:
+ * the model was targeting a checkpoint seq, which is its only route to
+ * distillation (tier 2/3 — acp_status and the nudge tier line ship exactly
+ * these seqs), so the answer it needs is that the checkpoint left the surface,
+ * that distilling it is therefore impossible, and where its content still
+ * lives (the block rebuilds from the log — `decompress bN`). Returns null when
+ * no edge is such a checkpoint, so an ordinary stale plain-text range keeps the
+ * generic copy.
+ */
+function foldedCheckpointNote(session: Session, error: AlreadyCompressedRangeError): string | null {
+  const ledger = rebuildBlockLedger(sessionEventsOf(session))
+  for (const edgeSeq of new Set([error.start, error.end])) {
+    // `blockRefForSummarySeq` reads the LOG (the folded node is gone from the
+    // surface, so no surface lookup could answer it) — the same extractor the
+    // distill edge itself resolves through.
+    const blockRef = blockRefForSummarySeq(session, edgeSeq)
+    if (blockRef === null) continue
+    // Only a block that actually recorded this seq as shadowed proves the fold;
+    // a checkpoint seq with no covering block is not this story.
+    const coveringBlockIds = ledger
+      .filter((entry) => entry.shadowedSeqs.includes(edgeSeq))
+      .map((entry) => entry.blockId)
+    if (coveringBlockIds.length === 0) continue
+    return `  seq ${edgeSeq} is the checkpoint of block ${blockRef} — a later compression folded that checkpoint into a new block, so distilling it is no longer possible; run decompress ${blockRef} to read its content`
+  }
+  return null
+}
+
 async function handleCompress(env: ToolEnvironment, args: CompressArgs, exec: ToolRunContext): Promise<TextOutput> {
   const agent = requireAgent(exec)
   const session = agent.session
@@ -531,6 +562,14 @@ async function handleCompress(env: ToolEnvironment, args: CompressArgs, exec: To
       resolved = resolveSurfaceRange(session, startSeq, endSeq)
     } catch (error) {
       if (error instanceof AlreadyCompressedRangeError) {
+        // A folded checkpoint gets its own copy: the model asked to distill,
+        // and "already compressed" alone never tells it that distillation is
+        // off the table for this block (see foldedCheckpointNote).
+        const foldedNote = foldedCheckpointNote(session, error)
+        if (foldedNote !== null) {
+          alreadyCompressedNotes.push(foldedNote)
+          continue
+        }
         const covering = error.coveringBlockIds
         const blockNote = covering.length === 0
           ? ''

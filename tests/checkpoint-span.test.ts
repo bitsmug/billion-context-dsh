@@ -38,7 +38,7 @@ import { Session } from '@deepseek-ai/dsh-session'
 import { allLogMessages } from '../src/messages.ts'
 import { kernelConfigFor } from '../src/config.ts'
 import { AcpStateStore } from '../src/state.ts'
-import { blockRefForSummarySeq, rebuildBlockLedger, resolveSurfaceRange, shadowedSeqsOf } from '../src/region.ts'
+import { blockRefForSummarySeq, blockRegistry, rebuildBlockLedger, resolveSurfaceRange, shadowedSeqsOf, summarySeqOfKernelBlock } from '../src/region.ts'
 import { edgeRefForSeq, makeTools, type ToolEnvironment } from '../src/tools.ts'
 import {
   appendAssistant,
@@ -293,5 +293,142 @@ test('cross-checkpoint span: while the checkpoint is inside the protection windo
   assert.ok(
     !folded.includes(String(checkpointSeq)),
     `inside the protection window the checkpoint is excluded from the fold (seq ${checkpointSeq})`,
+  )
+})
+
+/**
+ * Drive the "crossing" fold that takes a block's checkpoint node off the
+ * surface WITHOUT distilling it: tier-1 fold seqs 6..9 (checkpoint node seq 15,
+ * spliced in at surface index 5 — the position where the shadowed span started),
+ * push it out of the protected recent/last-user window, then fold seq 1 → 10.
+ *
+ * The cross is POSITIONAL, not numeric: the replace removes the surface slice
+ * between the two edge nodes (index 0 → index 6, the node at index 5 included),
+ * while the checkpoint's seq 15 sits outside the requested 1..10 and the
+ * residual nodes 10, 11, 12 behind it — the locally non-monotonic surface that
+ * rule 16 (AGENTS.md) documents. Measured: this is the ONLY edge shape that
+ * folds the node. A range whose start edge sits AFTER the checkpoint in surface
+ * order (e.g. seq 10 → last) leaves the node on the surface, the block active
+ * and its seq a real distillation target — so "start after the old block's
+ * originals" cannot fold it either: those originals are gone, and their
+ * surviving successors all sit BEHIND the checkpoint node.
+ */
+async function foldFirstCheckpoint(
+  env: ToolEnvironment,
+  session: Session,
+  callPrefix: string,
+): Promise<{ checkpointSeq: number; blockRef: string }> {
+  const compress = tool(env, 'compress')
+  const first = await compress.execute(
+    { content: [{ startSeq: 6, endSeq: 9, summary: SUMMARY }] } as never,
+    execStub(session, `${callPrefix}-1`),
+  )
+  assert.match((first as { text: string }).text, /Compressed 1 block/)
+  const checkpointSeq = checkpointSeqs(session)[0]!
+  const advertised = blockRegistry(session).find((entry) => entry.summarySeq === checkpointSeq)
+  assert.ok(advertised, 'the fresh checkpoint is advertised as a live distillation entry point')
+
+  appendTraffic(session, 17, 8)
+  const second = await compress.execute(
+    { content: [{ startSeq: 1, endSeq: 10, summary: `${SUMMARY} Range that crosses the checkpoint node.` }] } as never,
+    execStub(session, `${callPrefix}-2`),
+  )
+  assert.match((second as { text: string }).text, /Compressed 1 block/)
+  assert.ok(
+    !session.surface.nodes.includes(checkpointSeq as never),
+    `the crossing range folded the checkpoint node (seq ${checkpointSeq}) off the surface`,
+  )
+  return { checkpointSeq, blockRef: advertised.kernelBlockId }
+}
+
+test('cross-checkpoint span: a folded checkpoint is no longer advertised as a distill target', async () => {
+  const env = makeEnv()
+  const session = crossCheckpointFixture('checkpoint-folded-registry')
+  const { checkpointSeq, blockRef } = await foldFirstCheckpoint(env, session, 'call-folded')
+
+  // The field contract: `summarySeq` is a SURFACE seq ("null when gone"). The
+  // ledger derives it from the append-only log, where the checkpoint EVENT never
+  // disappears — so without the surface filter the registry keeps handing the
+  // model a seq that no longer exists, and acp_status's `Checkpoint seqs` row
+  // plus the nudge tier line (both read this value verbatim, via
+  // summarySeqOfKernelBlock) advertise it as a live distillation edge.
+  const folded = blockRegistry(session).find((entry) => entry.kernelBlockId === blockRef)
+  assert.equal(
+    folded?.summarySeq,
+    null,
+    `a checkpoint that left the surface must not be advertised (got ${folded?.summarySeq})`,
+  )
+  // The nudge's tier line reads the same field through `summarySeqOfKernelBlock`
+  // (src/region.ts) and drops null entries (src/nudge.ts — both the kernel and
+  // the template path), so the surface filter is what keeps a dead seq out of
+  // the tier line as well; `active` alone would not (a log without recorded
+  // lineage leaves the block active while its node is gone).
+  assert.equal(
+    summarySeqOfKernelBlock(session, blockRef),
+    null,
+    'the nudge tier line reads null for the folded block (filtered out of `seqs`)',
+  )
+
+  // acp_status is the model's only route to T2/T3 distillation, so no seq it
+  // names may be dead. (The folded block is also inactive, and the row filters
+  // on `active` — this pins the surface invariant itself, so a reader that
+  // drops that filter cannot resurrect the dead seq.)
+  const status = await tool(env, 'acp_status').execute({}, execStub(session, 'call-folded-3'))
+  const statusText = (status as { text: string }).text
+  assert.match(
+    statusText,
+    /Checkpoint seqs \(active blocks/,
+    'the row is still rendered — the newest block has a live checkpoint',
+  )
+  const row = /Checkpoint seqs[^\n]*/.exec(statusText)![0]
+  assert.ok(!row.includes(`seq ${checkpointSeq}`), `the row must not name the folded checkpoint: ${row}`)
+  for (const match of row.matchAll(/seq (\d+)/g)) {
+    const named = Number(match[1])
+    assert.ok(
+      session.surface.nodes.includes(named as never),
+      `the row names seq ${named}, which is not on the live surface: ${row}`,
+    )
+  }
+
+  // Nothing is lost: the block rebuilds from the log even though its checkpoint
+  // node is gone — `decompress bN` is the recovery route the compress copy names.
+  const recovered = await tool(env, 'decompress').execute(
+    { blockId: blockRef, inline: true } as never,
+    execStub(session, 'call-folded-4'),
+  )
+  assert.match((recovered as { text: string }).text, /a6|r8/, `decompress ${blockRef} still recovers the originals`)
+})
+
+test('cross-checkpoint span: compressing a folded checkpoint seq explains that distillation is gone', async () => {
+  const env = makeEnv()
+  const session = crossCheckpointFixture('checkpoint-folded-note')
+  const { checkpointSeq, blockRef } = await foldFirstCheckpoint(env, session, 'call-note')
+
+  // A model still holding the seq from an earlier acp_status/nudge (or an older
+  // transcript) retries the distillation call. The generic "already compressed"
+  // line never mentions distillation, so it reads as "retry later with other
+  // seqs" — the dedicated copy says the block's checkpoint was folded away, that
+  // distilling it is impossible, and where the content still lives.
+  const result = await tool(env, 'compress').execute(
+    {
+      content: [{
+        startSeq: checkpointSeq,
+        endSeq: checkpointSeq,
+        summary: 'Distillation attempt on a checkpoint a later range already folded away.',
+      }],
+    } as never,
+    execStub(session, 'call-note-3'),
+  )
+  const text = (result as { text: string }).text
+  assert.match(
+    text,
+    new RegExp(`seq ${checkpointSeq} is the checkpoint of block ${blockRef}`),
+    'the copy names the seq and the block whose checkpoint it was',
+  )
+  assert.match(text, /distilling it is no longer possible/, 'and says distillation is off the table')
+  assert.match(text, new RegExp(`decompress ${blockRef} to read its content`), 'and hands back the recovery route')
+  assert.ok(
+    !/already compressed \(block /.test(text),
+    'the generic copy is not used when the edge is a folded checkpoint',
   )
 })
